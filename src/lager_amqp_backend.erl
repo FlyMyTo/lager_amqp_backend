@@ -32,14 +32,15 @@
                 level,
                 exchange,
                 params,
-                routing_key
+                routing_key,
+		formatter_config
                }).
 init({RoutingKey, Level, Host}) when is_binary(RoutingKey), is_atom(Level) ->
     init([{routing_key, RoutingKey}, {level, Level}, {amqp_host, Host}]);
 
 init(Params) when is_list(Params) ->
   
-    Name  = config_val(name, Params, ?MODULE),  
+    Name  = config_val(name, Params, ?MODULE),
     Level = lager_util:level_to_num(config_val(level, Params, debug)),
     Exchange = config_val(exchange, Params, list_to_binary(atom_to_list(?MODULE))),
     RoutingKey  = config_val(routing_key, Params, undefined),
@@ -60,7 +61,8 @@ init(Params) when is_list(Params) ->
                  routing_key = RoutingKey,
                  level = Level, 
                  exchange = Exchange,
-                 params = AmqpParams
+                 params = AmqpParams,
+		 formatter_config = {_ContType, _Conf} = config_val(formatter_config, Params, {<<"application/json">>, undefined} )
                }}.
 
 handle_call({set_loglevel, Level}, #state{ name = _Name } = State) ->
@@ -77,9 +79,7 @@ handle_event({log,  Message}, #state{routing_key = RoutingKey, level = L } = Sta
     case lager_util:is_loggable(Message, L, {lager_amqp_backend, RoutingKey}) of
         true ->
             {ok, 
-            log(State, lager_msg:datetime(Message), 
-                       lager_msg:severity_as_int(Message),
-                       lager_msg:message(Message))};
+            log(State, L, Message)};
         false ->
             {ok, State}
     end;
@@ -96,27 +96,68 @@ terminate(_Reason, _State) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
-log(#state{params = AmqpParams } = State, {Date, Time}, Level, Message) ->
+format_utc_datetime2zulu({{Year, Month, Day}, {Hour, Min, Sec}}, Mls) ->
+    iolist_to_binary(
+      io_lib:format(
+	"~.4.0w-~.2.0w-~.2.0wT~.2.0w:~.2.0w:~.2.0w.~.3.0wZ",
+	[Year, Month, Day, Hour, Min, Sec, Mls] )).
+
+format_event(LagerMesg, #state{formatter_config = {<<"text/plain">>, Conf} })->
+    iolist_to_binary(lager_default_formatter:format(LagerMesg, Conf));
+format_event(LagerMesg, #state{formatter_config = {<<"application/json">>, _Conf} }) ->
+    DTBin  = format_utc_datetime2zulu(calendar:now_to_universal_time(os:timestamp()),0),
+    SevBin = atom_to_binary(lager_msg:severity(LagerMesg),latin1),
+    MsgBin = unicode:characters_to_binary(lists:flatten(lager_msg:message(LagerMesg))),
+    Meta = [ E || E={A,B} <- [ case M of
+				   {Key, Val}           -> {to_atom(Key), to_hr_bin(Val) };
+						%Pid when is_pid(Pid) -> {pid, Pid};
+						%Atom when is_atom(Atom) -> {tag, to_hr_bin(Atom)}
+				   _ -> skip
+			       end || M <- lager_msg:metadata(LagerMesg) ], is_atom(A), is_binary(B)],
+    jsonx:encode( {lists:flatten(
+		     [{timestamp, DTBin}, 
+		      {severity, SevBin},
+		      {meta, {Meta}},
+		      {message, MsgBin}])} ).
+
+to_hr_bin(B) when is_binary(B) ->
+    B;
+to_hr_bin(L) when is_list(L) andalso is_integer(hd(L)) ->
+    list_to_binary(L);
+to_hr_bin(A) when is_atom(A) ->
+    atom_to_binary(A,latin1);
+to_hr_bin(Any) ->
+    iolist_to_binary(io_lib:format("~p", [Any])).
+
+to_atom(A) when is_atom(A) ->
+    A;
+to_atom(L) when is_list(L) andalso is_integer(hd(L)) ->
+    list_to_atom(L);
+to_atom(B) when is_binary(B) ->
+    binary_to_atom(B, latin1).
+
+
+
+
+
+log(#state{params = AmqpParams } = State, Level, Message) ->
     case amqp_channel(AmqpParams) of
-        {ok, Channel} ->
-            Node = atom_to_list(node()),
-            Level1 = atom_to_list(lager_util:num_to_level(Level)),
-            send(State, Node, Level, [Date, " ", Time, " ", Node, " ", Level1, " ", Message], Channel);
+        {ok, Channel} ->	    
+            send(State, atom_to_list(node()), Level, format_event(Message, State), Channel);
         _ ->
             State
     end.    
 
 
-send(#state{ name = Name, exchange = Exchange, routing_key = RK } = State, Node, Level, Message, Channel) ->
-    
+send(#state{ name = Name, exchange = Exchange, routing_key = RK, 
+	     formatter_config = {ContType, _Conf} } = State, Node, Level, MessageBody, Channel) ->
     RoutingKey = case RK of
                      undefined -> routing_key(Node, Name, Level);
                      _ -> RK
                  end,
     Publish = #'basic.publish'{ exchange = Exchange, routing_key = RoutingKey },
-    Props = #'P_basic'{ content_type = <<"text/plain">> },
-    Body = unicode:characters_to_binary(lists:flatten(Message)),
-    Msg = #amqp_msg{ payload = Body, props = Props },
+    Props = #'P_basic'{ content_type = ContType },
+    Msg = #amqp_msg{ payload = MessageBody, props = Props },
     
     % io:format("message: ~p~n", [Msg]),
     amqp_channel:cast(Channel, Publish, Msg),
