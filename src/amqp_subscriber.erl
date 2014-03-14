@@ -31,7 +31,8 @@
 		connection, 
 		sub,
                 consumer_tag,
-		event_handler }).
+		event_handler,
+		buffer}).
 
 %%%===================================================================
 %%% API
@@ -45,17 +46,21 @@ start_link(RoutingKey, EventHandler) when is_binary(RoutingKey),
 notify(EventHandler, Event) when is_atom(EventHandler) ->
     EventHandler:notify(Event);
 notify(EventHandler, Event) when is_function(EventHandler, 1) ->
-    EventHandler(Event).
-
+    EventHandler(Event);
+notify(Bad, _) ->
+    exit({bad_event_handler, Bad}).
 
 start_link(RoutingKey) when is_binary(RoutingKey) ->
     ServerName = binary_to_atom(RoutingKey,latin1),
     gen_server:start_link(
       {local, ?MODULE}, 
       ?MODULE, 
-      [RoutingKey, fun(Evt) -> 
-			   Msg={bigwig_trace, Evt},
-			   bigwig_pubsubhub:notify(Msg)
+      [RoutingKey, fun(Evts) ->
+			   [begin
+				Msg={bigwig_trace, Evt},
+				bigwig_pubsubhub:notify(Msg)
+			    end || Evt <- Evts ],
+			   ok
 		   end ], []);
 
 start_link(_RoutingKey) ->
@@ -100,6 +105,8 @@ init([RoutingKey, EventHandler]) ->
     % Subscribe the channel and consume the message
     Consumer = self(),
     #'basic.consume_ok'{consumer_tag = Tag} = amqp_channel:subscribe(Channel, Sub, Consumer),
+    % Start timer to flush each second
+    {ok, _} = timer:send_interval(1000, flush),
     io:format("init start ~n"),
     io:format("channel is ~p~n",[Channel]),
     io:format("consumer_tag is ~p~n",[Tag]),
@@ -108,7 +115,8 @@ init([RoutingKey, EventHandler]) ->
 		connection = Connection, 
 		sub = Sub, 
 		consumer_tag = Tag, 
-		event_handler = EventHandler}}.
+		event_handler = EventHandler,
+		buffer = []}}.
 
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -145,15 +153,16 @@ handle_info(#'basic.consume_ok'{}, State) ->
 handle_info(#'basic.cancel_ok'{}, State) ->
     {noreply, State};
 
-handle_info({#'basic.deliver'{ delivery_tag = Tag}, 
-	     {_, _, Message} = _Content }, 
-	    #state{channel = Channel, 
-		   event_handler = EventHandler} = State) ->
-    io:format("> ~ts~n", [Message]),
-    notify(EventHandler, Message),
-    amqp_channel:cast(Channel, #'basic.ack'{delivery_tag = Tag}),
-    {noreply, State};
-
+handle_info({#'basic.deliver'{ delivery_tag = Tag}, {_, _, Message} = _Content } , 
+	    #state{ buffer = Events } = State) ->
+    lager:log(debug, [], "RCVD: ~ts~n", [Message]),
+    Events1 = [ {Tag, Message} | Events],
+    {noreply, if length(Events1) > 1000 ->
+		      flush(State);
+		 true -> State#state{ buffer = Events1 }
+	      end };
+handle_info(flush, State) ->
+    {noreply, flush(State)};
 handle_info(_Info, State) ->
     {noreply, State}.
 
@@ -162,6 +171,23 @@ terminate(_Reason, _State) ->
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
+
+flush(#state{ buffer = [] } = State) ->
+    State;
+flush(#state{channel       = Channel, 
+	     event_handler = EventHandler,
+	     buffer        = Events} = State) ->
+    {Tags, Messages} = lists:unzip(lists:reverse(Events)),
+    try
+	notify(EventHandler, Messages),
+	[ amqp_channel:cast(Channel, #'basic.ack'{delivery_tag = Tag}) || Tag <- Tags ],
+	lager:log(debug, [], "Flushed ~p events", [length(Events)]),
+	State#state{ buffer = [] }
+    catch
+	_:Reason ->
+	    lager:log(critical, [], "Failed to notify handler ~p due to ~p~n", [EventHandler, Reason]),
+	    State
+    end.
 
 %%%===================================================================
 %%% Internal functions
