@@ -11,8 +11,9 @@
 -behaviour(gen_server).
 
 %% API
--export([start_link/1,
-          cast/1]).
+-export([ start_link/1,
+	  start_link/2,
+	  cast/1 ]).
 
 %% gen_server callbacks
 -export([init/1, 
@@ -27,17 +28,35 @@
 
 
 -record(state, {channel,
-                 connection, 
-                 sub,
-                consumer_tag}).
+		connection, 
+		sub,
+                consumer_tag,
+		event_handler }).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
+start_link(RoutingKey, EventHandler) when is_binary(RoutingKey), 
+					  ( is_atom(EventHandler) orelse is_function(EventHandler, 1))  ->
+    ServerName = binary_to_atom(RoutingKey,latin1),
+    gen_server:start_link({local, ?MODULE}, ?MODULE, [RoutingKey, EventHandler], []).
+
+notify(EventHandler, Event) when is_atom(EventHandler) ->
+    EventHandler:notify(Event);
+notify(EventHandler, Event) when is_function(EventHandler, 1) ->
+    EventHandler(Event).
+
+
 start_link(RoutingKey) when is_binary(RoutingKey) ->
     ServerName = binary_to_atom(RoutingKey,latin1),
-    gen_server:start_link({local, ?MODULE}, ?MODULE, [RoutingKey], []);
+    gen_server:start_link(
+      {local, ?MODULE}, 
+      ?MODULE, 
+      [RoutingKey, fun(Evt) -> 
+			   Msg={bigwig_trace, Evt},
+			   bigwig_pubsubhub:notify(Msg)
+		   end ], []);
 
 start_link(_RoutingKey) ->
     io:format("RoutingKey should be binary type").
@@ -48,7 +67,7 @@ cast(Msg) ->
 %%% gen_server callbacks
 %%%===================================================================
 
-init([RoutingKey]) ->
+init([RoutingKey, EventHandler]) ->
     LagerEnv = case application:get_all_env(lager) of
                    undefined -> [];
                    Env -> Env
@@ -85,7 +104,11 @@ init([RoutingKey]) ->
     io:format("channel is ~p~n",[Channel]),
     io:format("consumer_tag is ~p~n",[Tag]),
     io:format("init over ~n"),
-    {ok, #state{channel = Channel, connection = Connection, sub = Sub, consumer_tag = Tag}}.
+    {ok, #state{channel = Channel, 
+		connection = Connection, 
+		sub = Sub, 
+		consumer_tag = Tag, 
+		event_handler = EventHandler}}.
 
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -122,11 +145,12 @@ handle_info(#'basic.consume_ok'{}, State) ->
 handle_info(#'basic.cancel_ok'{}, State) ->
     {noreply, State};
 
-handle_info({#'basic.deliver'{delivery_tag = Tag}, {_, _, Message} = _Content}, 
-    #state{channel = Channel} = State) ->
+handle_info({#'basic.deliver'{ delivery_tag = Tag}, 
+	     {_, _, Message} = _Content }, 
+	    #state{channel = Channel, 
+		   event_handler = EventHandler} = State) ->
     io:format("> ~ts~n", [Message]),
-    Msg={bigwig_trace, Message},
-    bigwig_pubsubhub:notify(Msg),
+    notify(EventHandler, Message),
     amqp_channel:cast(Channel, #'basic.ack'{delivery_tag = Tag}),
     {noreply, State};
 
