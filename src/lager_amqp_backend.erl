@@ -108,12 +108,17 @@ format_event(LagerMesg, #state{formatter_config = {<<"application/json">>, _Conf
     DTBin  = format_utc_datetime2zulu(calendar:now_to_universal_time(os:timestamp()),0),
     SevBin = atom_to_binary(lager_msg:severity(LagerMesg),latin1),
     MsgBin = unicode:characters_to_binary(lists:flatten(lager_msg:message(LagerMesg))),
-    Meta = [ E || E={A,B} <- [ case M of
+    Meta0 = [ E || E={A,B} <- [ case M of
 				   {Key, Val}           -> {to_atom(Key), to_hr_bin(Val) };
 						%Pid when is_pid(Pid) -> {pid, Pid};
 						%Atom when is_atom(Atom) -> {tag, to_hr_bin(Atom)}
 				   _ -> skip
 			       end || M <- lager_msg:metadata(LagerMesg) ], is_atom(A), is_binary(B)],
+    Meta = 
+	case lists:keymember(node, 1, Meta0) of
+	    false -> [{node, to_hr_bin(node())} | Meta0 ];
+	    true -> Meta0
+	end,
     jsonx:encode( {lists:flatten(
 		     [{timestamp, DTBin}, 
 		      {severity, SevBin},
