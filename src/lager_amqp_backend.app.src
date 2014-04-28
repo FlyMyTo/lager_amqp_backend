@@ -7,14 +7,5 @@
     stdlib,
     lager
   ]},
-  {env, [
-         {name,           "lager_amqp_backend"},
-         {level,          debug},
-         {exchange,       <<"lager_amqp_backend">>},
-         {amqp_user,      <<"guest">>},
-         {amqp_pass,      <<"guest">>},
-         {amqp_vhost,     <<"/">>},
-         {amqp_host,      "localhost"},
-         {amqp_port,      5672}
-        ]}
+  {env, [ ]}
 ]}.

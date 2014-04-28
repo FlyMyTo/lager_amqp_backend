@@ -30,3 +30,6 @@ $(DEPS_EZ):
 
 compile: $(DEPS_DIR)
 	./rebar compile
+
+run: compile
+	./start.sh

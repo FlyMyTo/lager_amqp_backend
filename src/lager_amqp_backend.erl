@@ -28,45 +28,92 @@
         ]).
 -export([test/0]).
 
--record(state, {name,
-                level,
+-record(state, {level,
                 exchange,
                 params,
                 routing_key,
-		formatter_config
+		formatter_config,
+		vars
                }).
-init({RoutingKey, Level, Host}) when is_binary(RoutingKey), is_atom(Level) ->
-    init([{routing_key, RoutingKey}, {level, Level}, {amqp_host, Host}]);
+-record(state_await_conf, { config_ready_msg, init }).
+
+to_bin(B) when is_binary(B) ->
+    B;
+to_bin(L) when is_list(L)   ->
+    list_to_binary(L);
+to_bin(A) when is_atom(A)   ->
+    atom_to_binary(A, latin1).
+
+to_str(B) when is_binary(B) ->
+    binary_to_list(B);
+to_str(L) when is_list(L)   ->
+    L;
+to_str(A) when is_atom(A)   ->
+    atom_to_list(A).
+
+to_int(I) when is_integer(I) ->
+    I;
+to_int(B) when is_binary(B)  ->
+    list_to_integer(binary_to_list(B));
+to_int(L) when is_list(L)    ->
+    list_to_integer(L).
 
 init(Params) when is_list(Params) ->
-  
-    Name  = config_val(name, Params, ?MODULE),
-    Level = lager_util:level_to_num(config_val(level, Params, debug)),
-    Exchange = config_val(exchange, Params, list_to_binary(atom_to_list(?MODULE))),
-    RoutingKey  = config_val(routing_key, Params, undefined),
+    ConfMod     = config_val(conf_mod,  Params, ?MODULE),
+    GetEnv      = if ConfMod == ?MODULE -> 
+			  fun(Var) -> config_val(Var, Params) end;
+		     true ->
+			  fun(Var) -> ConfMod:get_env(lager_amqp_backend, Var) end
+		  end,
+    Init = 
+	fun() -> 
+		Level      = lager_util:level_to_num(GetEnv(level)),
+		Exchange   = to_bin(GetEnv(exchange)),
+		RoutingKeyFmt = case GetEnv(routing_key) of
+				    undefined -> [node_host, node_name, level];
+				    V         -> V
+				end,
+		AmqpParams = #amqp_params_network {
+				username       = to_bin(GetEnv(user) ),
+				password       = to_bin(GetEnv(pass) ),
+				virtual_host   = to_bin(GetEnv(vhost)),
+				host           = to_str(GetEnv(host) ),
+				port           = to_int(GetEnv(port) )
+			       },
+		lager:log(info, [], "Lager AMQP params are: ~p~n", [AmqpParams]),
+		{ok, Channel} = amqp_channel(AmqpParams),
+		#'exchange.declare_ok'{} = amqp_channel:call(
+					     Channel, #'exchange.declare'{
+							 exchange = Exchange, 
+							 type = <<"topic">> }),
+		Vars = mk_vars(),
+		#state{ routing_key      = RoutingKeyFmt,
+			level            = Level, 
+			exchange         = Exchange,
+			params           = AmqpParams,
+			formatter_config = {<<"application/json">>, undefined},
+			vars = Vars
+		      }
+	end,
 
-    AmqpParams = #amqp_params_network {
-      username       = config_val(amqp_user, Params, <<"guest">>),
-      password       = config_val(amqp_pass, Params, <<"guest">>),
-      virtual_host   = config_val(amqp_vhost, Params, <<"/">>),
-      host           = config_val(amqp_host, Params, "127.0.0.1"),
-      port           = config_val(amqp_port, Params, 5672)
-     },
-  
-    {ok, Channel} = amqp_channel(AmqpParams),
-    #'exchange.declare_ok'{} = amqp_channel:call(Channel, #'exchange.declare'{ exchange = Exchange, 
-                                                                               type = <<"topic">> }),
-  
-    {ok, #state{ name  = Name,
-                 routing_key = RoutingKey,
-                 level = Level, 
-                 exchange = Exchange,
-                 params = AmqpParams,
-		 formatter_config = {_ContType, _Conf} = config_val(formatter_config, Params, {<<"application/json">>, undefined} )
-               }}.
+    if ConfMod == ?MODULE -> 
+	    CMsg = config_ready_msg,
+	    self() ! CMsg;
+       true -> 
+	    CMsg = ConfMod:config_ready_msg()
+    end,
+    {ok, #state_await_conf{ 
+	    config_ready_msg = CMsg,
+	    init = Init } }.
 
-handle_call({set_loglevel, Level}, #state{ name = _Name } = State) ->
-    % io:format("Changed loglevel of ~s to ~p~n", [Name, Level]),
+mk_vars() ->
+    NodeStr = atom_to_list(node()),
+    [NodeName, NodeHost] = string:tokens(NodeStr, "@"),
+    [{node_name, NodeName},
+     {node_host, NodeHost},
+     {node, NodeStr}].
+
+handle_call({set_loglevel, Level}, #state{ } = State) ->
     {ok, ok, State#state{ level=lager_util:level_to_num(Level) }};
     
 handle_call(get_loglevel, #state{ level = Level } = State) ->
@@ -87,6 +134,12 @@ handle_event({log,  Message}, #state{routing_key = RoutingKey, level = L } = Sta
 handle_event(_Event, State) ->
     {ok, State}.
 
+handle_info(Msg, #state_await_conf{ 
+		    config_ready_msg = Msg,
+		    init             = InitFun } = _State) ->
+    State1 = InitFun(),
+    lager:log(info, [], "Config ready~n", []),
+    {ok, State1};
 handle_info(_Info, State) ->
     {ok, State}.
 
@@ -154,28 +207,44 @@ log(#state{params = AmqpParams } = State, Level, Message) ->
     end.    
 
 
-send(#state{ name = Name, exchange = Exchange, routing_key = RK, 
-	     formatter_config = {ContType, _Conf} } = State, Node, Level, MessageBody, Channel) ->
-    RoutingKey = case RK of
-                     undefined -> routing_key(Node, Name, Level);
-                     _ -> RK
-                 end,
-    Publish = #'basic.publish'{ exchange = Exchange, routing_key = RoutingKey },
-    Props = #'P_basic'{ content_type = ContType },
-    Msg = #amqp_msg{ payload = MessageBody, props = Props },
-    
-    % io:format("message: ~p~n", [Msg]),
+send(#state{ exchange         = Exchange, 
+	     routing_key      = RoutingKeyFmt, 
+	     formatter_config = {ContType, _Conf},
+	     vars             = Vars} = State, 
+     _Node, LevelNum, MessageBody, Channel) ->
+    Level      = atom_to_list(lager_util:num_to_level(LevelNum)),
+    RoutingKey = format_routing_key(RoutingKeyFmt, [{level, Level} | Vars]),
+    Publish    = #'basic.publish'{ exchange = Exchange, routing_key = RoutingKey },
+    Props      = #'P_basic'{ content_type = ContType },
+    Msg        = #amqp_msg{ payload = MessageBody, props = Props },
+%%    lager:log(debug, [], "SEND: RK = ~p, MSG = ~p", [RoutingKey, MessageBody]),
     amqp_channel:cast(Channel, Publish, Msg),
-    
     State.
 
-routing_key(Node, Name, Level) ->
-    RkPrefix = atom_to_list(lager_util:num_to_level(Level)),
-    RoutingKey =  case Name of
-                      []   ->  string:join([Node, RkPrefix], ".");
-                      Name ->  string:join([Node, Name, RkPrefix], ".")
-                  end,
+format_routing_key(RoutingKeyFmt, _Env) when is_binary(RoutingKeyFmt) ->
+    RoutingKeyFmt;
+format_routing_key(RoutingKeyFmt, Env) ->
+    RoutingKey = 
+	string:join(
+	  [ if is_atom(Elem) ->
+		    case proplists:get_value(Elem, Env) of
+			undefined ->
+			    case atom_to_list(Elem) of
+				[$$ | OSVarName] ->
+				    os:getenv(OSVarName);
+				_ -> exit({var_undef, Elem})
+			    end;
+			Val -> to_str(Val)
+		    end;
+	       true -> to_str(Elem)
+	    end || Elem <- RoutingKeyFmt], "."),
     list_to_binary(RoutingKey).
+
+config_val(C, Params) ->
+  case lists:keyfind(C, 1, Params) of
+    {C, V} -> V;
+    _ -> undefined
+  end.
 
 config_val(C, Params, Default) ->
     case lists:keyfind(C, 1, Params) of
@@ -190,6 +259,8 @@ amqp_channel(AmqpParams) ->
             maybe_new_pid({AmqpParams, channel},
                           fun() -> amqp_connection:open_channel(Client) end);
         Error ->
+	    lager:log(error, [], "Failed to establish AMQP channel. Reason = ~p. Params = ~p.",
+		      [Error, AmqpParams]),
             Error
     end.
 

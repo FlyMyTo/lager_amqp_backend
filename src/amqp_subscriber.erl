@@ -26,7 +26,7 @@
 -define(SERVER, ?MODULE). 
 -include_lib("amqp_client/include/amqp_client.hrl").
 
-
+-record(state_await_conf, { config_ready_msg, init }).
 -record(state, {channel,
 		connection, 
 		sub,
@@ -38,9 +38,10 @@
 %%% API
 %%%===================================================================
 
-start_link(RoutingKey, EventHandler) when is_binary(RoutingKey), 
-					  ( is_atom(EventHandler) orelse is_function(EventHandler, 1))  ->
-    ServerName = binary_to_atom(RoutingKey,latin1),
+start_link(RoutingKey, EventHandler) 
+  when is_binary(RoutingKey), 
+       ( is_atom(EventHandler) orelse is_function(EventHandler, 1))  ->
+    %ServerName = binary_to_atom(RoutingKey,latin1),
     gen_server:start_link({local, ?MODULE}, ?MODULE, [RoutingKey, EventHandler], []).
 
 notify(EventHandler, Event) when is_atom(EventHandler) ->
@@ -51,7 +52,6 @@ notify(Bad, _) ->
     exit({bad_event_handler, Bad}).
 
 start_link(RoutingKey) when is_binary(RoutingKey) ->
-    ServerName = binary_to_atom(RoutingKey,latin1),
     gen_server:start_link(
       {local, ?MODULE}, 
       ?MODULE, 
@@ -72,51 +72,87 @@ cast(Msg) ->
 %%% gen_server callbacks
 %%%===================================================================
 
+to_bin(B) when is_binary(B) ->
+    B;
+to_bin(L) when is_list(L)   ->
+    list_to_binary(L);
+to_bin(A) when is_atom(A)   ->
+    atom_to_binary(A, latin1).
+
+to_str(B) when is_binary(B) ->
+    binary_to_list(B);
+to_str(L) when is_list(L)   ->
+    L;
+to_str(A) when is_atom(A)   ->
+    atom_to_list(A).
+
+to_int(I) when is_integer(I) ->
+    I;
+to_int(B) when is_binary(B)  ->
+    list_to_integer(binary_to_list(B));
+to_int(L) when is_list(L)    ->
+    list_to_integer(L).
+
+
 init([RoutingKey, EventHandler]) ->
     LagerEnv = case application:get_all_env(lager) of
-                   undefined -> [];
-                   Env -> Env
-               end,
+		   undefined -> [];
+		   Env -> Env
+	       end,
     HandlerConf = config_val(handlers, LagerEnv, []),
-    Params = config_val(lager_amqp_backend, HandlerConf, []),
-    
-    Exchange = config_val(exchange, Params, <<"lager_amqp_backend">>),
-    AmqpParams = #amqp_params_network {
-      username       = config_val(amqp_user, Params, <<"guest">>),
-      password       = config_val(amqp_pass, Params, <<"guest">>),
-      virtual_host   = config_val(amqp_vhost, Params, <<"/">>),
-      host           = config_val(amqp_host, Params, "localhost"),
-      port           = config_val(amqp_port, Params, 5672)
-     },
+    Params      = config_val(lager_amqp_backend, HandlerConf, []),
+    ConfMod     = config_val(amqp_conf_mod,  Params, ?MODULE),
+    GetEnv      = if ConfMod == ?MODULE -> 
+			  fun(Var) -> config_val(Var, Params) end;
+		      true ->
+			  fun(Var) -> ConfMod:get_env(lager_amqp_backend, Var) end
+		  end,
+    Init = fun() ->
+	    Exchange   = to_bin(GetEnv(exchange)),
+	    AmqpParams = #amqp_params_network {
+			    username       = to_bin(GetEnv(user) ),
+			    password       = to_bin(GetEnv(pass) ),
+			    virtual_host   = to_bin(GetEnv(vhost)),
+			    host           = to_str(GetEnv(host) ),
+			    port           = to_int(GetEnv(port) )
+			   },
 
-    {ok, Connection} =
-        amqp_connection:start(AmqpParams),
-    {ok, Channel} = amqp_connection:open_channel(Connection),
-
-    %{ok, Channel} = amqp_channel(AmqpParams),
-    #'exchange.declare_ok'{} = amqp_channel:call(Channel, #'exchange.declare'{ exchange = Exchange, 
-                                                                               type = <<"topic">> }),
-
-    %% Declare a queue
-    #'queue.declare_ok'{queue = Q} = amqp_channel:call(Channel, #'queue.declare'{}),
-    Binding = #'queue.bind'{queue = Q, exchange = Exchange, routing_key = RoutingKey},
-     #'queue.bind_ok'{} = amqp_channel:call(Channel, Binding),
-    Sub = #'basic.consume'{queue = Q},
-    % Subscribe the channel and consume the message
-    Consumer = self(),
-    #'basic.consume_ok'{consumer_tag = Tag} = amqp_channel:subscribe(Channel, Sub, Consumer),
-    % Start timer to flush each second
-    {ok, _} = timer:send_interval(1000, flush),
-    io:format("init start ~n"),
-    io:format("channel is ~p~n",[Channel]),
-    io:format("consumer_tag is ~p~n",[Tag]),
-    io:format("init over ~n"),
-    {ok, #state{channel = Channel, 
-		connection = Connection, 
-		sub = Sub, 
-		consumer_tag = Tag, 
-		event_handler = EventHandler,
-		buffer = []}}.
+	    {ok, Connection} =
+		amqp_connection:start(AmqpParams),
+	    {ok, Channel} = amqp_connection:open_channel(Connection),
+	    #'exchange.declare_ok'{} = amqp_channel:call(
+					 Channel, #'exchange.declare'{ 
+						     exchange = Exchange, 
+						     type = <<"topic">> }),
+	    %% Declare a queue
+	    #'queue.declare_ok'{queue = Q} = amqp_channel:call(Channel, #'queue.declare'{}),
+	    Binding = #'queue.bind'{
+			 queue = Q, exchange = Exchange, 
+			 routing_key = RoutingKey},
+	    #'queue.bind_ok'{} = amqp_channel:call(Channel, Binding),
+	    Sub = #'basic.consume'{queue = Q},
+	    %% Subscribe the channel and consume the message
+	    Consumer = self(),
+	    #'basic.consume_ok'{consumer_tag = Tag} = 
+		       amqp_channel:subscribe(Channel, Sub, Consumer),
+	    %% Start timer to flush each second
+	    {ok, _} = timer:send_interval(1000, flush),
+	    #state{channel       = Channel, 
+		   connection    = Connection, 
+		   sub           = Sub, 
+		   consumer_tag  = Tag, 
+		   event_handler = EventHandler,
+		   buffer        = []}
+    end,
+    if ConfMod == ?MODULE -> 
+	    CMsg = config_ready_msg,
+	    self() ! CMsg;
+       true -> 
+	    CMsg = ConfMod:config_ready_msg()
+    end,
+    {ok, #state_await_conf{ 
+	    config_ready_msg = CMsg,
+	    init = Init } }.
 
 handle_call(_Request, _From, State) ->
     Reply = ok,
@@ -128,12 +164,9 @@ handle_cast({unsubscribe}, State) ->
     Channel = State#state.channel,
     Connection = State#state.connection,
     Method = #'basic.cancel'{consumer_tag = Consumer_tag},
-    #'basic.cancel_ok'{consumer_tag = Consumer_tag1} = amqp_channel:call(Channel, Method),
+    #'basic.cancel_ok'{consumer_tag = _} = amqp_channel:call(Channel, Method),
     amqp_channel:close(Channel),
     amqp_channel:close(Connection),
-    io:format("channel is ~p~n",[Channel]),
-    io:format("consumer_tag is ~p~n",[Consumer_tag1]),
-    io:format("unsubscribe over ~n"),
     {noreply, State};
 handle_cast({subscribe}, State) ->
      Channel=State#state.channel,
@@ -141,13 +174,15 @@ handle_cast({subscribe}, State) ->
      Consumer=self(),
      io:format("subscribe again"),
      #'basic.consume_ok'{consumer_tag = Consumer_tag} = amqp_channel:subscribe(Channel, Sub, Consumer),
-     io:format("channel is ~p~n",[Channel]),
-     io:format("consumer_tag is ~p~n",[Consumer_tag]),
-     io:format("subscribe again over"),
      {noreply,#state{consumer_tag=Consumer_tag}};
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
+handle_info(Msg, #state_await_conf{ 
+		    config_ready_msg = Msg,
+		    init             = InitFun } = _State) ->
+    lager:log(debug, [], "Config ready~n", []),
+    {noreply, InitFun()};
 handle_info(#'basic.consume_ok'{}, State) ->
     {noreply, State};
 handle_info(#'basic.cancel_ok'{}, State) ->
@@ -193,34 +228,11 @@ flush(#state{channel       = Channel,
 %%% Internal functions
 %%%===================================================================
 
-
-amqp_channel(AmqpParams) ->
-    case maybe_new_pid({AmqpParams, connection},
-                       fun() -> amqp_connection:start(AmqpParams) end) of
-        {ok, Client} ->
-            maybe_new_pid({AmqpParams, channel},
-                          fun() -> amqp_connection:open_channel(Client) end);
-        Error ->
-            Error
-    end.
-
-maybe_new_pid(Group, StartFun) ->
-    case pg2:get_closest_pid(Group) of
-        {error, {no_such_group, _}} ->
-            pg2:create(Group),
-            maybe_new_pid(Group, StartFun);
-        {error, {no_process, _}} ->
-            case StartFun() of
-                {ok, Pid} ->
-                    pg2:join(Group, Pid),
-                    {ok, Pid};
-                Error ->
-                    Error
-            end;
-        Pid ->
-            {ok, Pid}
-    end.
-
+config_val(C, Params) ->
+  case lists:keyfind(C, 1, Params) of
+    {C, V} -> V;
+    _ -> exit({env_var_not_configured, C})
+  end.
 
 config_val(C, Params, Default) ->
   case lists:keyfind(C, 1, Params) of
