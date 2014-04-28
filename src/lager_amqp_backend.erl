@@ -231,7 +231,9 @@ format_routing_key(RoutingKeyFmt, Env) ->
 			undefined ->
 			    case atom_to_list(Elem) of
 				[$$ | OSVarName] ->
-				    os:getenv(OSVarName);
+				    Val = os:getenv(OSVarName),
+				    Val == false andalso exit({var_undef, Elem}),
+				    Val;
 				_ -> exit({var_undef, Elem})
 			    end;
 			Val -> to_str(Val)
