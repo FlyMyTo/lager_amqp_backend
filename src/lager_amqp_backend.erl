@@ -226,7 +226,14 @@ format_routing_key(RoutingKeyFmt, _Env) when is_binary(RoutingKeyFmt) ->
 format_routing_key(RoutingKeyFmt, Env) ->
     RoutingKey = 
 	string:join(
-	  [ if is_atom(Elem) ->
+	  [ case Elem of
+		{OSVarNameA, Default} when is_atom(OSVarNameA) ->
+		    [$$ | OSVarName] = atom_to_list(OSVarNameA),
+		    case os:getenv(OSVarName) of
+			false -> to_str(Default);
+			Val   -> Val
+		    end;
+		_ when is_atom(Elem) ->
 		    case proplists:get_value(Elem, Env) of
 			undefined ->
 			    case atom_to_list(Elem) of
@@ -234,16 +241,13 @@ format_routing_key(RoutingKeyFmt, Env) ->
 				    Val = os:getenv(OSVarName),
 				    Val == false andalso exit({var_undef, Elem}),
 				    Val;
-				{[$$ | OSVarName], Default} ->
-				    case os:getenv(OSVarName) of
-					false -> Default;
-					Val   -> Val
-				    end;
 				_ -> exit({var_undef, Elem})
 			    end;
 			Val -> to_str(Val)
 		    end;
-	       true -> to_str(Elem)
+	       _ when is_binary(Elem) orelse 
+		      is_list(Elem)   orelse 
+		      is_atom(Elem) -> to_str(Elem)
 	    end || Elem <- RoutingKeyFmt], "."),
     list_to_binary(RoutingKey).
 
