@@ -234,6 +234,11 @@ format_routing_key(RoutingKeyFmt, Env) ->
 				    Val = os:getenv(OSVarName),
 				    Val == false andalso exit({var_undef, Elem}),
 				    Val;
+				{[$$ | OSVarName], Default} ->
+				    case os:getenv(OSVarName) of
+					false -> Default;
+					Val   -> Val
+				    end;
 				_ -> exit({var_undef, Elem})
 			    end;
 			Val -> to_str(Val)
