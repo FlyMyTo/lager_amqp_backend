@@ -33,9 +33,18 @@
                 params,
                 routing_key,
 		formatter_config,
-		vars
+		vars,
+		amqp_channel, 
+		amqp_connection
                }).
--record(state_await_conf, { config_ready_msg, init }).
+-record(state_await_conf, { id, config_ready_msg, init }).
+
+-define(LOG_ERROR(Rep), 
+	error_logger:error_report(Rep)).
+-define(LOG_WARN(Rep), 
+	error_logger:warning_report(Rep)).
+-define(LOG_INFO(Rep), 
+	error_logger:info_report(Rep)).
 
 to_bin(B) when is_binary(B) ->
     B;
@@ -65,10 +74,11 @@ init(Params) when is_list(Params) ->
 		     true ->
 			  fun(Var) -> ConfMod:get_env(lager_amqp_backend, Var) end
 		  end,
+    Me = make_ref(),
     Init = 
 	fun() -> 
-		Level      = lager_util:level_to_num(GetEnv(level)),
-		Exchange   = to_bin(GetEnv(exchange)),
+		Level         = lager_util:level_to_num(GetEnv(level)),
+		Exchange      = to_bin(GetEnv(exchange)),
 		RoutingKeyFmt = case GetEnv(routing_key) of
 				    undefined -> [node_host, node_name, level];
 				    V         -> V
@@ -78,22 +88,23 @@ init(Params) when is_list(Params) ->
 				password       = to_bin(GetEnv(pass) ),
 				virtual_host   = to_bin(GetEnv(vhost)),
 				host           = to_str(GetEnv(host) ),
-				port           = to_int(GetEnv(port) )
+				port           = to_int(GetEnv(port) ),
+				heartbeat      = 10,
+				connection_timeout = 10000
 			       },
-		lager:log(info, [], "Lager AMQP params are: ~p~n", [AmqpParams]),
-		{ok, Channel} = amqp_channel(AmqpParams),
-		#'exchange.declare_ok'{} = amqp_channel:call(
-					     Channel, #'exchange.declare'{
-							 exchange = Exchange, 
-							 type = <<"topic">> }),
 		Vars = mk_vars(),
-		#state{ routing_key      = RoutingKeyFmt,
-			level            = Level, 
-			exchange         = Exchange,
-			params           = AmqpParams,
-			formatter_config = {<<"application/json">>, undefined},
-			vars = Vars
-		      }
+		self() ! {connect, Me, 0, 
+			  fun() ->
+				  connect(
+				    #state{
+				       routing_key      = RoutingKeyFmt,
+				       level            = Level, 
+				       exchange         = Exchange,
+				       params           = AmqpParams,
+				       formatter_config = {<<"application/json">>, undefined},
+				       vars             = Vars
+				      })
+			  end}
 	end,
 
     if ConfMod == ?MODULE -> 
@@ -102,7 +113,8 @@ init(Params) when is_list(Params) ->
        true -> 
 	    CMsg = ConfMod:config_ready_msg()
     end,
-    {ok, #state_await_conf{ 
+    {ok, #state_await_conf{
+	    id = Me, 
 	    config_ready_msg = CMsg,
 	    init = Init } }.
 
@@ -136,12 +148,53 @@ handle_event(_Event, State) ->
 
 handle_info(Msg, #state_await_conf{ 
 		    config_ready_msg = Msg,
-		    init             = InitFun } = _State) ->
-    State1 = InitFun(),
-    lager:log(info, [], "Config ready~n", []),
+		    init             = InitFun } = State) ->
+    InitFun(),
+    {ok, State};
+handle_info({connect, Id, N, ConnectFun}, 
+	    #state_await_conf{ id = Id } = State) ->
+    State1 = 
+	try ConnectFun()
+	catch 
+	    _:Reason ->
+		NextInterval = get_interval(N),
+		?LOG_WARN(
+		   ["Lager AMQP backend connect attempt failed.", 
+		    {reason, Reason},
+		    {reconnect_after, NextInterval}]),
+		timer:send_after(NextInterval, {connect, Id, N + 1, ConnectFun}),
+		State
+	end,
     {ok, State1};
-handle_info(_Info, State) ->
+handle_info({'DOWN', _Mref, process, ChanPid, Reason}, 
+ 	    #state{ amqp_channel = ChanPid} = State) ->
+    ?LOG_ERROR(["Lager AMQP backend have lost channel.",
+		{reason, Reason}]),
+    exit(amqp_channel_down),
+     {ok, State};
+handle_info({'DOWN', _Mref, process, ConnPid, Reason}, 
+	    #state{ amqp_connection = ConnPid} = State) ->
+    ?LOG_ERROR(["Lager AMQP backend have lost connecton.",
+		{reason, Reason}]),
+    exit(amqp_connection_down),
+    {ok, State};
+handle_info(_Inf, State) ->
+    io:format("INFO >>>>>>> ~p~n",[_Inf]),
     {ok, State}.
+
+get_interval(N) ->
+         5000 *
+        (case N of
+             0 -> 1;
+	     1 -> 1;
+             2 -> 2;
+             3 -> 4;
+             4 -> 8;
+             5 -> 16;
+             6 -> 24;
+             _ -> 30
+         end).
+
 
 terminate(_Reason, _State) ->
     ok.
@@ -166,7 +219,8 @@ format_event(LagerMesg, #state{formatter_config = {<<"application/json">>, _Conf
 						%Pid when is_pid(Pid) -> {pid, Pid};
 						%Atom when is_atom(Atom) -> {tag, to_hr_bin(Atom)}
 				   _ -> skip
-			       end || M <- lager_msg:metadata(LagerMesg) ], is_atom(A), is_binary(B)],
+			       end || M <- lager_msg:metadata(LagerMesg) ], 
+		   is_atom(A), is_binary(B)],
     Meta = 
 	case lists:keymember(node, 1, Meta0) of
 	    false -> [{node, to_hr_bin(node())} | Meta0 ];
@@ -198,26 +252,21 @@ to_atom(B) when is_binary(B) ->
 
 
 
-log(#state{params = AmqpParams } = State, Level, Message) ->
-    case amqp_channel(AmqpParams) of
-        {ok, Channel} ->	    
-            send(State, atom_to_list(node()), Level, format_event(Message, State), Channel);
-        _ ->
-            State
-    end.    
+log(#state{} = State, Level, Message) ->
+    send(State, Level, format_event(Message, State)).
 
 
 send(#state{ exchange         = Exchange, 
 	     routing_key      = RoutingKeyFmt, 
 	     formatter_config = {ContType, _Conf},
-	     vars             = Vars} = State, 
-     _Node, LevelNum, MessageBody, Channel) ->
+	     vars             = Vars,
+	     amqp_channel     = Channel } = State, 
+     LevelNum, MessageBody) ->
     Level      = atom_to_list(lager_util:num_to_level(LevelNum)),
     RoutingKey = format_routing_key(RoutingKeyFmt, [{level, Level} | Vars]),
     Publish    = #'basic.publish'{ exchange = Exchange, routing_key = RoutingKey },
     Props      = #'P_basic'{ content_type = ContType },
     Msg        = #amqp_msg{ payload = MessageBody, props = Props },
-%%    lager:log(debug, [], "SEND: RK = ~p, MSG = ~p", [RoutingKey, MessageBody]),
     amqp_channel:cast(Channel, Publish, Msg),
     State.
 
@@ -263,34 +312,28 @@ config_val(C, Params, Default) ->
         _ -> Default
     end.
 
-amqp_channel(AmqpParams) ->
-    case maybe_new_pid({AmqpParams, connection},
-                       fun() -> amqp_connection:start(AmqpParams) end) of
-        {ok, Client} ->
-            maybe_new_pid({AmqpParams, channel},
-                          fun() -> amqp_connection:open_channel(Client) end);
-        Error ->
-	    lager:log(error, [], "Failed to establish AMQP channel. Reason = ~p. Params = ~p.",
-		      [Error, AmqpParams]),
-            Error
-    end.
 
-maybe_new_pid(Group, StartFun) ->
-    case pg2:get_closest_pid(Group) of
-        {error, {no_such_group, _}} ->
-            pg2:create(Group),
-            maybe_new_pid(Group, StartFun);
-        {error, {no_process, _}} ->
-            case StartFun() of
-                {ok, Pid} ->
-                    pg2:join(Group, Pid),
-                    {ok, Pid};
-                Error ->
-                    Error
-            end;
-        Pid ->
-            {ok, Pid}
-    end.
+connect(#state{ params = AmqpParams, exchange = Exchange } = State) ->
+    %% 1. Create connection & channel
+    {ok, Connection } = amqp_connection:start(AmqpParams),
+    {ok, Channel    } = amqp_connection:open_channel(Connection),
+    %% %% 2. Create exchange
+    #'exchange.declare_ok'{} = 
+    	amqp_channel:call(
+    	  Channel, 
+    	  #'exchange.declare'{
+    	     exchange = Exchange, 
+    	     type = <<"topic">>,
+	     durable = true }),
+    %% %% 3. Create default queue & bind it to exchange
+    %% #'queue.declare_ok'{} =
+    %% 	amqp_channel:call(Channel, #'queue.declare'{queue=Exchange}),
+    %% #'queue.bind_ok'{} =
+    %% 	amqp_channel:call(Channel, #'queue.bind'{queue=Exchange,exchange=Exchange}),
+    %% 4. Start monitor channel & connection pids
+%%    erlang:monitor(process, Channel),
+    erlang:monitor(process, Connection),
+    State#state{ amqp_channel = Channel, amqp_connection = Connection }.
   
 test() ->
   application:load(lager),
